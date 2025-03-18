@@ -1,14 +1,16 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/Context.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/cpp_custom_type_hack.h>
-#include <ATen/Context.h>
+#include <ATen/native/mkldnn/MKLDNNCommon.h>
+#include <ATen/native/quantized/PackedParams.h>
+#include <ATen/native/quantized/cpu/ACLUtils.h>
+#include <ATen/native/quantized/cpu/OnednnUtils.h>
+#include <ATen/native/quantized/cpu/QnnpackUtils.h>
+#include <ATen/native/quantized/cpu/QuantUtils.h>
 #include <ATen/native/quantized/cpu/fbgemm_utils.h>
 #include <ATen/native/quantized/cpu/init_qnnpack.h>
-#include <ATen/native/quantized/PackedParams.h>
-#include <ATen/native/quantized/cpu/QnnpackUtils.h>
-#include <ATen/native/quantized/cpu/OnednnUtils.h>
-#include <ATen/native/quantized/cpu/QuantUtils.h>
-#include <ATen/native/mkldnn/MKLDNNCommon.h>
+#include <ATen/native/quantized/library.h>
 #include <ATen/quantized/Quantizer.h>
 #include <torch/custom_class.h>
 #include <torch/library.h>
@@ -30,8 +32,6 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
-
-int register_linear_params();
 
 #ifdef USE_FBGEMM
 namespace {
@@ -280,12 +280,15 @@ c10::intrusive_ptr<LinearPackedParamsBase> PackedLinearWeightsOnednn::prepack(
     packed_bias.init(bias_desc, b.data_ptr());
     onednn_bias = std::optional<ideep::tensor>(packed_bias);
   }
-  auto ret_ptr = c10::make_intrusive<PackedLinearWeightsOnednn>(
-      PackedLinearWeightsOnednn{
-        std::move(weight_ptr),
-        onednn_bias,
-        weight,
-        bias});
+#if AT_MKLDNN_ACL_ENABLED()
+  if (qtype == c10::kPerTensorAffine) {
+    return c10::make_intrusive<PackedLinearWeightsACL>(PackedLinearWeightsACL{
+        std::move(weight_ptr), onednn_bias, weight, bias});
+  }
+#endif // #if AT_MKLDNN_ACL_ENABLED()
+  auto ret_ptr =
+      c10::make_intrusive<PackedLinearWeightsOnednn>(PackedLinearWeightsOnednn{
+          std::move(weight_ptr), onednn_bias, weight, bias});
   return ret_ptr;
 }
 
@@ -305,6 +308,24 @@ inline at::Tensor pack_weight_to_onednn_tensor(
   auto packed_weight = at::native::new_with_itensor_mkldnn(
       std::move(expected_weight),
       c10::optTypeMetaToScalarType(weight.options().dtype_opt()),
+      weight.options().device_opt());
+  return packed_weight;
+}
+
+inline at::Tensor pack_weight_to_fp16_onednn_tensor(
+    at::Tensor& weight,
+    std::optional<torch::List<int64_t>>& input_shape) {
+  TORCH_CHECK(weight.scalar_type() == at::kHalf || weight.scalar_type() == at::kFloat, "Weight should be of type float or float16");
+  weight = weight.scalar_type() == at::kHalf ? weight : at::_saturate_weight_to_fp16(weight);
+  std::vector<int64_t> w_dims = weight.sizes().vec();
+  auto weight_fp16 = weight.to(at::kHalf);
+  ideep::tensor wei = ideep::tensor({w_dims, dnnl::memory::data_type::f16}, weight_fp16.data_ptr());
+  auto expected_weight = wei.transpose(0, 1); // oneDNN requires transposed weight
+  // Onednn does not support f32f16f32 matmul, so we need to convert weight to f32 before compute
+  // Therefore, we just return weight in plain format
+  auto packed_weight = at::native::new_with_itensor_mkldnn(
+      std::move(expected_weight),
+      c10::kHalf,
       weight.options().device_opt());
   return packed_weight;
 }
@@ -436,12 +457,12 @@ at::Tensor wrapped_quantized_linear_meta(
 #endif // USE_FBGEMM
 }
 
-at::Tensor wrapped_linear_prepack(const at::Tensor& weight,
+at::Tensor _wrapped_linear_prepack(const at::Tensor& weight,
     const at::Tensor& weight_scale,
     const at::Tensor& weight_zero_point,
     const at::Tensor& bias);
 
-at::Tensor wrapped_linear_prepack(const at::Tensor& weight,
+at::Tensor _wrapped_linear_prepack(const at::Tensor& weight,
     const at::Tensor& weight_scale,
     const at::Tensor& weight_zero_point,
     const at::Tensor& bias) {
@@ -474,14 +495,14 @@ at::Tensor wrapped_linear_prepack(const at::Tensor& weight,
 #endif // USE_FBGEMM
 }
 
-at::Tensor wrapped_quantized_linear_prepacked(const at::Tensor& input, const at::Tensor& input_scale,
+at::Tensor _wrapped_quantized_linear_prepacked(const at::Tensor& input, const at::Tensor& input_scale,
     const at::Tensor& input_zero_point,
     const at::Tensor& packed_weight,
     const at::Tensor& output_scale,
     const at::Tensor& output_zero_point,
     [[maybe_unused]] const int64_t out_channel);
 
-at::Tensor wrapped_quantized_linear_prepacked(const at::Tensor& input, const at::Tensor& input_scale,
+at::Tensor _wrapped_quantized_linear_prepacked(const at::Tensor& input, const at::Tensor& input_scale,
     const at::Tensor& input_zero_point,
     const at::Tensor& packed_weight,
     const at::Tensor& output_scale,
@@ -507,12 +528,12 @@ at::Tensor wrapped_quantized_linear_prepacked(const at::Tensor& input, const at:
 #endif // USE_FBGEMM
 }
 
-at::Tensor wrapped_linear_prepack_meta(const at::Tensor& weight,
+at::Tensor _wrapped_linear_prepack_meta(const at::Tensor& weight,
     [[maybe_unused]] const at::Tensor& weight_scale,
     [[maybe_unused]] const at::Tensor& weight_zero_point,
     [[maybe_unused]] const at::Tensor& bias);
 
-at::Tensor wrapped_linear_prepack_meta(const at::Tensor& weight,
+at::Tensor _wrapped_linear_prepack_meta(const at::Tensor& weight,
     [[maybe_unused]] const at::Tensor& weight_scale,
     [[maybe_unused]] const at::Tensor& weight_zero_point,
     [[maybe_unused]] const at::Tensor& bias) {
@@ -530,7 +551,7 @@ at::Tensor wrapped_linear_prepack_meta(const at::Tensor& weight,
 #endif // USE_FBGEMM
 }
 
-at::Tensor wrapped_quantized_linear_prepacked_meta(const at::Tensor& input,
+at::Tensor _wrapped_quantized_linear_prepacked_meta(const at::Tensor& input,
     [[maybe_unused]] const at::Tensor& input_scale,
     [[maybe_unused]] const at::Tensor& input_zero_point,
     [[maybe_unused]] const at::Tensor& packed_weight,
@@ -538,7 +559,7 @@ at::Tensor wrapped_quantized_linear_prepacked_meta(const at::Tensor& input,
     [[maybe_unused]] const at::Tensor& output_zero_point,
     const int64_t out_channel);
 
-at::Tensor wrapped_quantized_linear_prepacked_meta(const at::Tensor& input,
+at::Tensor _wrapped_quantized_linear_prepacked_meta(const at::Tensor& input,
     [[maybe_unused]] const at::Tensor& input_scale,
     [[maybe_unused]] const at::Tensor& input_zero_point,
     [[maybe_unused]] const at::Tensor& packed_weight,
@@ -672,6 +693,21 @@ class QLinearPackWeightInt8Onednn final {
   }
 };
 
+class QLinearPackWeightFp16Onednn final {
+ public:
+  static at::Tensor run(
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    [[maybe_unused]] at::Tensor weight, // Not QTensor
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    [[maybe_unused]] std::optional<torch::List<int64_t>> input_shape) {
+#if AT_MKLDNN_ENABLED()
+    return pack_weight_to_fp16_onednn_tensor(weight, input_shape);
+#else
+    TORCH_CHECK(false, "Unimplemented as onednn is not available.");
+#endif
+  }
+};
+
 TORCH_LIBRARY_IMPL(quantized, QuantizedCPU, m) {
   register_linear_params();
   m.impl(TORCH_SELECTIVE_NAME("quantized::linear_prepack"), TORCH_FN(QLinearPackWeightInt8::run));
@@ -695,25 +731,29 @@ TORCH_LIBRARY_IMPL(_quantized, CPU, m) {
   m.impl(TORCH_SELECTIVE_NAME("_quantized::linear_prepack_fp16_legacy"), TORCH_FN(QLinearPackWeightFp16Legacy::run));
   m.impl(TORCH_SELECTIVE_NAME("_quantized::wrapped_quantized_linear"), TORCH_FN(wrapped_quantized_linear));
   m.impl(
-      TORCH_SELECTIVE_NAME("_quantized::wrapped_linear_prepack"),
-      wrapped_linear_prepack);
+      TORCH_SELECTIVE_NAME("_quantized::_wrapped_linear_prepack"),
+      _wrapped_linear_prepack);
   m.impl(
-      TORCH_SELECTIVE_NAME("_quantized::wrapped_quantized_linear_prepacked"),
-      wrapped_quantized_linear_prepacked);
+      TORCH_SELECTIVE_NAME("_quantized::_wrapped_quantized_linear_prepacked"),
+      _wrapped_quantized_linear_prepacked);
 }
 
 TORCH_LIBRARY_IMPL(_quantized, Meta, m) {
   m.impl(TORCH_SELECTIVE_NAME("_quantized::wrapped_quantized_linear"), TORCH_FN(wrapped_quantized_linear_meta));
   m.impl(
-      TORCH_SELECTIVE_NAME("_quantized::wrapped_linear_prepack"),
-      wrapped_linear_prepack_meta);
+      TORCH_SELECTIVE_NAME("_quantized::_wrapped_linear_prepack"),
+      _wrapped_linear_prepack_meta);
   m.impl(
-      TORCH_SELECTIVE_NAME("_quantized::wrapped_quantized_linear_prepacked"),
-      wrapped_quantized_linear_prepacked_meta);
+      TORCH_SELECTIVE_NAME("_quantized::_wrapped_quantized_linear_prepacked"),
+      _wrapped_quantized_linear_prepacked_meta);
 }
 
 TORCH_LIBRARY_IMPL(onednn, CPU, m) {
   m.impl(TORCH_SELECTIVE_NAME("onednn::qlinear_prepack"), TORCH_FN(QLinearPackWeightInt8Onednn::run));
+}
+
+TORCH_LIBRARY_IMPL(onednn, CPU, m) {
+  m.impl(TORCH_SELECTIVE_NAME("onednn::linear_prepack_fp16"), TORCH_FN(QLinearPackWeightFp16Onednn::run));
 }
 
 } // namespace

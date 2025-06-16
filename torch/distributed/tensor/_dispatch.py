@@ -154,7 +154,9 @@ class OpDispatcher:
         self.sharding_propagator.propagate(op_info)
         output_sharding = op_info.output_sharding
         logger.debug("output_sharding for %s: %s", op_call, output_sharding)
-        assert output_sharding is not None, "output sharding should not be None"
+        assert (
+            output_sharding is not None
+        ), "output sharding should not be None"  # Pei: This should not happen?
 
         mesh = op_info.compute_mesh
         if mesh.get_coordinate() is not None:
@@ -279,6 +281,7 @@ class OpDispatcher:
             assert len(out_dts) >= 1, "out variant should have at least one out arg"
             return tuple(out_dts) if len(out_dts) > 1 else out_dts[0]
         else:
+            # print(op_call.__name__)
             return self.wrap(local_results, output_sharding.output_spec)  # type: ignore[possibly-undefined]
 
     @staticmethod
@@ -400,9 +403,13 @@ class OpDispatcher:
     def wrap(res: object, spec: OutputSpecType) -> object:
         if isinstance(res, torch.Tensor):
             if spec is not None:
-                assert isinstance(spec, DTensorSpec), (
-                    f"output spec does not match with output! Expected DTensorSpec, got {spec}."
-                )
+                # if not isinstance(spec, DTensorSpec):
+                #     raise RuntimeError(
+                #         f"output spec does not match with output! Expected DTensorSpec, got {spec}."
+                #     )
+                assert isinstance(
+                    spec, DTensorSpec
+                ), f"output spec does not match with output! Expected DTensorSpec, got {spec}."
                 return dtensor.DTensor(res, spec, requires_grad=res.requires_grad)
             else:
                 # if output does not have a DTensorSpec due to specific ops, it must be a scalar tensor

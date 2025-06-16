@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+import logging
 import threading
 from collections.abc import Sequence
 from functools import lru_cache
@@ -24,9 +25,12 @@ from torch.distributed.tensor._utils import (
     compute_local_shape_and_global_offset,
     compute_local_stride,
 )
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 
 aten = torch.ops.aten
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 
 def _length(obj) -> int:
@@ -446,6 +450,7 @@ class ShardingPropagator:
             # step 1. there's sharding propagation rule, run
             # sharding propagation to get the output sharding
             try:
+                # torch.distributed.breakpoint()
                 output_sharding = sharding_prop_func(op_schema)
             except NotImplementedError as e:
                 raise e
@@ -483,9 +488,83 @@ class ShardingPropagator:
 
             return output_sharding
         else:
-            raise NotImplementedError(
-                f"Operator {op_schema.op} does not have a sharding strategy registered."
+            # Pei: fallback to duplication (on first dim) schema instead of erroring out
+            logger.debug(
+                "op: [%s] doesn't have sharding strategy. Fallback to duplication.",
+                op_schema.op,
             )
+            print(
+                f"op: {op_schema.op} doesn't have sharding strategy. Fallback to duplication."
+            )
+
+            # Write the op to a file for tracking
+            fallback_ops_file = "/tmp/dtensor_fallback_ops.txt"
+            try:
+                with open(fallback_ops_file, "a") as f:
+                    f.write(f"{op_schema.op}\n")
+            except Exception as e:
+                logger.warning(f"Failed to write to fallback ops file: {e}")
+
+            # redistribute input to replicate.
+            fallback_placement = (Replicate(),)
+            mesh = op_schema.args_spec[0].mesh  # assume only one mesh config
+            suggestion_args = list(op_schema.args_schema)
+            for idx, input_spec in enumerate(op_schema.args_spec):
+                # dup on first dim temporary
+                if input_spec.placements != fallback_placement:
+                    # overwrite the schema
+                    suggestion_args[idx] = DTensorSpec(
+                        mesh=mesh,
+                        placements=fallback_placement,
+                        tensor_meta=input_spec.tensor_meta,
+                    )
+            suggestion_schema = OpSchema(
+                op_schema.op, tuple(suggestion_args), op_schema.kwargs_schema
+            )
+
+            # Create proper DTensorSpec objects for the output
+            returns = op_schema.op._schema.returns
+            output_specs = []
+
+            if isinstance(out_tensor_meta, TensorMeta):
+                # Single output case
+                output_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=fallback_placement,
+                        tensor_meta=out_tensor_meta
+                    )
+                )
+            elif isinstance(out_tensor_meta, (tuple, list)):
+                # Multiple outputs case
+                for i, ret in enumerate(returns):
+                    if i < len(out_tensor_meta):
+                        current_meta = out_tensor_meta[i]
+                        if isinstance(current_meta, TensorMeta):
+                            output_specs.append(
+                                DTensorSpec(
+                                    mesh=mesh,
+                                    placements=fallback_placement,
+                                    tensor_meta=current_meta
+                                )
+                            )
+                        else:
+                            output_specs.append(None)
+                    else:
+                        output_specs.append(None)
+
+            # Use the created output_specs in the OutputSharding
+            output_sharding = OutputSharding(
+                tuple(output_specs) if len(output_specs) > 1 else output_specs[0] if output_specs else None,
+                suggestion_schema,
+                needs_redistribute=True,
+            )
+
+            return output_sharding
+
+            # raise NotImplementedError(
+            #     f"Operator {op_schema.op} does not have a sharding strategy registered."
+            # )
 
     def _select_strategy(self, strategy: OpStrategy) -> OpSpec:
         if len(strategy.strategies) == 1:
@@ -494,9 +573,9 @@ class ShardingPropagator:
 
         op_spec_costs: list[float] = []
         for op_spec in strategy.strategies:
-            assert op_spec.redistribute_cost is not None, (
-                "must set redistribute cost each OpSpec!"
-            )
+            assert (
+                op_spec.redistribute_cost is not None
+            ), "must set redistribute cost each OpSpec!"
             redistribute_cost = sum(chain.from_iterable(op_spec.redistribute_cost))
             op_spec_costs.append(redistribute_cost)
 
